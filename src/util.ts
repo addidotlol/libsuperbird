@@ -49,6 +49,51 @@ export function isAscii(text: string): boolean {
   return true;
 }
 
+export interface ByteSegment {
+  start: number;
+  end: number;
+}
+
+export function nonZeroSegments(data: Uint8Array, granularity: number, minSkipBytes: number): ByteSegment[] {
+  const blockCount = Math.ceil(data.length / granularity);
+  const runs: ByteSegment[] = [];
+  let runStart = -1;
+  for (let i = 0; i < blockCount; i++) {
+    const start = i * granularity;
+    const zero = isZeroRegion(data, start, Math.min(granularity, data.length - start));
+    if (!zero && runStart < 0) runStart = i;
+    if (zero && runStart >= 0) {
+      runs.push({ start: runStart, end: i });
+      runStart = -1;
+    }
+  }
+  if (runStart >= 0) runs.push({ start: runStart, end: blockCount });
+
+  const minGapBlocks = Math.max(1, Math.ceil(minSkipBytes / granularity));
+  const merged: ByteSegment[] = [];
+  for (const run of runs) {
+    const previous = merged[merged.length - 1];
+    if (previous && run.start - previous.end < minGapBlocks) previous.end = run.end;
+    else merged.push({ ...run });
+  }
+  return merged.map(run => ({
+    start: run.start * granularity,
+    end: Math.min(run.end * granularity, data.length),
+  }));
+}
+
+function isZeroRegion(data: Uint8Array, start: number, length: number): boolean {
+  const end = start + length;
+  let i = start;
+  if ((data.byteOffset + i) % 8 === 0) {
+    const words = new BigUint64Array(data.buffer, data.byteOffset + i, Math.floor((end - i) / 8));
+    for (const word of words) if (word !== 0n) return false;
+    i += words.length * 8;
+  }
+  for (; i < end; i++) if (data[i] !== 0) return false;
+  return true;
+}
+
 export class ByteReader {
   private reader: ReadableStreamDefaultReader<Uint8Array>;
   private pending: Uint8Array | null = null;

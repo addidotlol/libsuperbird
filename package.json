@@ -1,6 +1,6 @@
 {
   "name": "libsuperbird",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WebUSB library for flashing the Spotify Car Thing (Superbird)",
   "license": "AGPL-3.0-only",
   "author": "addidotlol",

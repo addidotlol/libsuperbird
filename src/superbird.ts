@@ -14,6 +14,7 @@ import {
   sleep,
   toBytes,
   withTimeout,
+  nonZeroSegments,
 } from './util.js';
 
 export type SuperbirdMode = 'usb' | 'usb-burn' | 'normal';
@@ -23,6 +24,7 @@ export type ConnectStatus = 'connecting' | 'bl2-boot' | 'resetting' | 'waiting-r
 export interface FlashProgress {
   percent: number;
   bytesWritten: number;
+  bytesSkipped: number;
   totalBytes: number;
   elapsedMs: number;
   etaMs: number;
@@ -41,6 +43,7 @@ export interface SuperbirdConfig {
   slowCommandMs: number;
   resetDelayMs: number;
   reconnectTimeoutMs: number;
+  sparseSkipThreshold: number;
 }
 
 export const DEFAULT_CONFIG: SuperbirdConfig = {
@@ -54,6 +57,7 @@ export const DEFAULT_CONFIG: SuperbirdConfig = {
   slowCommandMs: 3000,
   resetDelayMs: 5000,
   reconnectTimeoutMs: 30_000,
+  sparseSkipThreshold: 1024 * 1024,
 };
 
 export interface ConnectOptions {
@@ -68,6 +72,7 @@ export interface WriteOptions {
   onProgress?: (progress: FlashProgress) => void;
   signal?: AbortSignal;
   blockLength?: number;
+  sparse?: boolean;
 }
 
 const USB_FILTERS: USBDeviceFilter[] = [
@@ -79,18 +84,21 @@ const INTERFACE_NUMBER = 0;
 
 class ProgressTracker {
   private start = performance.now();
-  private written = 0;
+  private processed = 0;
+  private skipped = 0;
 
   constructor(private total: number) {}
 
-  advance(bytes: number, chunkMs: number): FlashProgress {
-    this.written += bytes;
+  advance(bytes: number, chunkMs: number, skippedBytes = 0): FlashProgress {
+    this.processed += bytes;
+    this.skipped += skippedBytes;
     const elapsedMs = performance.now() - this.start;
-    const avgBytesPerSec = elapsedMs > 0 ? this.written / (elapsedMs / 1000) : this.written;
-    const remaining = this.total - this.written;
+    const avgBytesPerSec = elapsedMs > 0 ? this.processed / (elapsedMs / 1000) : this.processed;
+    const remaining = this.total - this.processed;
     return {
-      percent: (this.written / this.total) * 100,
-      bytesWritten: this.written,
+      percent: (this.processed / this.total) * 100,
+      bytesWritten: this.processed - this.skipped,
+      bytesSkipped: this.skipped,
       totalBytes: this.total,
       elapsedMs,
       etaMs: avgBytesPerSec > 0 ? (remaining / avgBytesPerSec) * 1000 : 0,
@@ -526,6 +534,28 @@ export class Superbird {
     }
   }
 
+  async erase(lba: number, sectorCount: number): Promise<void> {
+    await this.bulkcmd('mmc dev 1 0');
+    await this.bulkcmd(`mmc erase ${hex(lba)} ${hex(sectorCount)}`);
+  }
+
+  async erasePartition(name: PartitionName): Promise<void> {
+    if (name === 'cache') throw invalidOperation('the "cache" partition is zero-length and cannot be accessed');
+    if (name === 'reserved') throw invalidOperation('the "reserved" partition cannot be read or written');
+    await this.ensurePartitionTable();
+    await this.bulkcmd(`amlmmc erase ${name}`);
+  }
+
+  private async readsBackZero(readCommand: string): Promise<boolean> {
+    try {
+      await this.bulkcmd(readCommand);
+      const sector = await this.readMemory(proto.ADDR_TMP, proto.PART_SECTOR_SIZE);
+      return sector.every(byte => byte === 0);
+    } catch {
+      return false;
+    }
+  }
+
   async restorePartition(name: PartitionName, data: StreamSource, options: WriteOptions = {}): Promise<void> {
     const partSize = await this.validatePartitionSize(name);
     const { reader, size } = await resolveStream(data);
@@ -536,13 +566,21 @@ export class Superbird {
       throw invalidOperation(`file is larger than target partition: ${size} bytes vs ${effectivePartSize} bytes`);
     }
 
+    let sparse = false;
+    if (options.sparse && name !== 'bootloader') {
+      await this.erasePartition(name);
+      sparse = await this.readsBackZero(
+        `amlmmc read ${name} ${hex(proto.ADDR_TMP)} 0 ${hex(proto.PART_SECTOR_SIZE)}`,
+      );
+    }
+
     await this.bulkcmd('amlmmc key');
     await this.stagedWrite(
       reader,
       size,
       (offset, length) => `amlmmc write ${name} ${hex(proto.ADDR_TMP)} ${hex(offset)} ${hex(length)}`,
       options,
-      name === 'bootloader',
+      { expectTimeout: name === 'bootloader', sparse },
     );
   }
 
@@ -550,6 +588,12 @@ export class Superbird {
     const { reader, size } = await resolveStream(data);
 
     await this.bulkcmd('mmc dev 1 0');
+
+    let sparse = false;
+    if (options.sparse) {
+      sparse = await this.readsBackZero(`mmc read ${hex(proto.ADDR_TMP)} ${hex(lba)} 1`);
+    }
+
     await this.bulkcmd('amlmmc key');
     await this.stagedWrite(
       reader,
@@ -560,6 +604,7 @@ export class Superbird {
         return `mmc write ${hex(proto.ADDR_TMP)} ${hex(chunkLba)} ${hex(sectors)}`;
       },
       options,
+      { sparse },
     );
   }
 
@@ -595,9 +640,10 @@ export class Superbird {
     totalBytes: number,
     makeCommand: (byteOffset: number, byteLength: number) => string,
     options: WriteOptions,
-    expectTimeout = false,
+    flags: { expectTimeout?: boolean; sparse?: boolean } = {},
   ): Promise<void> {
     const tracker = new ProgressTracker(totalBytes);
+    const blockLength = options.blockLength ?? this.config.transferBlockSize;
     let offset = 0;
 
     try {
@@ -607,19 +653,29 @@ export class Superbird {
 
         const length = Math.min(totalBytes - offset, this.config.stageChunkSize);
         const chunk = await reader.readExact(length);
-        await this.writeLargeMemory(proto.ADDR_TMP, chunk, options.blockLength ?? this.config.transferBlockSize);
+        const segments = flags.sparse
+          ? nonZeroSegments(chunk, blockLength, this.config.sparseSkipThreshold)
+          : [{ start: 0, end: length }];
 
-        if (expectTimeout) {
-          await this.bulkcmd(makeCommand(offset, length)).catch(() => {});
-          await sleep(2000);
-        } else {
-          const commandStart = performance.now();
-          await retry(this.config.writeRetries, this.config.cooldownMs, () => this.bulkcmd(makeCommand(offset, length)));
-          if (performance.now() - commandStart > this.config.slowCommandMs) await sleep(this.config.cooldownMs);
+        let written = 0;
+        for (const segment of segments) {
+          options.signal?.throwIfAborted();
+          await this.writeLargeMemory(proto.ADDR_TMP, chunk.subarray(segment.start, segment.end), blockLength);
+          const command = makeCommand(offset + segment.start, segment.end - segment.start);
+
+          if (flags.expectTimeout) {
+            await this.bulkcmd(command).catch(() => {});
+            await sleep(2000);
+          } else {
+            const commandStart = performance.now();
+            await retry(this.config.writeRetries, this.config.cooldownMs, () => this.bulkcmd(command));
+            if (performance.now() - commandStart > this.config.slowCommandMs) await sleep(this.config.cooldownMs);
+          }
+          written += segment.end - segment.start;
         }
 
         offset += length;
-        options.onProgress?.(tracker.advance(length, performance.now() - chunkStart));
+        options.onProgress?.(tracker.advance(length, performance.now() - chunkStart, length - written));
       }
     } finally {
       await reader.cancel();
