@@ -82,6 +82,36 @@ export function nonZeroSegments(data: Uint8Array, granularity: number, minSkipBy
   }));
 }
 
+export function writableSegments(
+  chunk: Uint8Array,
+  chunkOffset: number,
+  granularity: number,
+  minSkipBytes: number,
+  skippable: ByteSegment | null,
+): ByteSegment[] {
+  const chunkEnd = chunkOffset + chunk.length;
+  const skipFrom = skippable ? Math.max(chunkOffset, skippable.start) : chunkEnd;
+  const skipTo = skippable ? Math.min(chunkEnd, skippable.end) : chunkEnd;
+  if (skipTo <= skipFrom) return [{ start: 0, end: chunk.length }];
+
+  const head = skipFrom - chunkOffset;
+  const tail = skipTo - chunkOffset;
+  const segments: ByteSegment[] = [];
+  if (head > 0) segments.push({ start: 0, end: head });
+  for (const run of nonZeroSegments(chunk.subarray(head, tail), granularity, minSkipBytes)) {
+    segments.push({ start: head + run.start, end: head + run.end });
+  }
+  if (tail < chunk.length) segments.push({ start: tail, end: chunk.length });
+
+  const merged: ByteSegment[] = [];
+  for (const segment of segments) {
+    const previous = merged[merged.length - 1];
+    if (previous && previous.end === segment.start) previous.end = segment.end;
+    else merged.push({ ...segment });
+  }
+  return merged;
+}
+
 function isZeroRegion(data: Uint8Array, start: number, length: number): boolean {
   const end = start + length;
   let i = start;

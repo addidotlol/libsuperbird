@@ -35,6 +35,7 @@ export const AMLC_MAX_TRANSFER_LENGTH = 65536;
 
 export const PART_SECTOR_SIZE = 512;
 export const TRANSFER_BLOCK_SIZE = 8 * PART_SECTOR_SIZE;
+export const ERASE_GROUP_SECTORS = 8 * 1024;
 
 export const COMMAND_TIMEOUT_MS = 10_000;
 export const BULK_TIMEOUT_MS = 2_000;

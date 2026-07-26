@@ -5,6 +5,7 @@ import { SUPERBIRD_PARTITIONS, type PartitionName } from './partitions.js';
 import * as proto from './protocol.js';
 import {
   type BinarySource,
+  type ByteSegment,
   type StreamSource,
   ByteReader,
   hex,
@@ -14,7 +15,7 @@ import {
   sleep,
   toBytes,
   withTimeout,
-  nonZeroSegments,
+  writableSegments,
 } from './util.js';
 
 export type SuperbirdMode = 'usb' | 'usb-burn' | 'normal';
@@ -566,12 +567,13 @@ export class Superbird {
       throw invalidOperation(`file is larger than target partition: ${size} bytes vs ${effectivePartSize} bytes`);
     }
 
-    let sparse = false;
+    let skippable: ByteSegment | null = null;
     if (options.sparse && name !== 'bootloader') {
       await this.erasePartition(name);
-      sparse = await this.readsBackZero(
+      const erasedToZero = await this.readsBackZero(
         `amlmmc read ${name} ${hex(proto.ADDR_TMP)} 0 ${hex(proto.PART_SECTOR_SIZE)}`,
       );
+      if (erasedToZero) skippable = { start: 0, end: size };
     }
 
     await this.bulkcmd('amlmmc key');
@@ -580,7 +582,7 @@ export class Superbird {
       size,
       (offset, length) => `amlmmc write ${name} ${hex(proto.ADDR_TMP)} ${hex(offset)} ${hex(length)}`,
       options,
-      { expectTimeout: name === 'bootloader', sparse },
+      { expectTimeout: name === 'bootloader', skippable },
     );
   }
 
@@ -589,10 +591,7 @@ export class Superbird {
 
     await this.bulkcmd('mmc dev 1 0');
 
-    let sparse = false;
-    if (options.sparse) {
-      sparse = await this.readsBackZero(`mmc read ${hex(proto.ADDR_TMP)} ${hex(lba)} 1`);
-    }
+    const skippable = options.sparse ? await this.eraseWholeGroupsIn(lba, size) : null;
 
     await this.bulkcmd('amlmmc key');
     await this.stagedWrite(
@@ -604,8 +603,25 @@ export class Superbird {
         return `mmc write ${hex(proto.ADDR_TMP)} ${hex(chunkLba)} ${hex(sectors)}`;
       },
       options,
-      { sparse },
+      { skippable },
     );
+  }
+
+  private async eraseWholeGroupsIn(lba: number, byteLength: number): Promise<ByteSegment | null> {
+    const spanSectors = Math.ceil(byteLength / proto.PART_SECTOR_SIZE);
+    const groupStart = Math.ceil(lba / proto.ERASE_GROUP_SECTORS) * proto.ERASE_GROUP_SECTORS;
+    const groupEnd =
+      Math.floor((lba + spanSectors) / proto.ERASE_GROUP_SECTORS) * proto.ERASE_GROUP_SECTORS;
+    if (groupEnd <= groupStart) return null;
+
+    await this.bulkcmd(`mmc erase ${hex(groupStart)} ${hex(groupEnd - groupStart)}`);
+    const erasedToZero = await this.readsBackZero(`mmc read ${hex(proto.ADDR_TMP)} ${hex(groupStart)} 1`);
+    if (!erasedToZero) return null;
+
+    return {
+      start: (groupStart - lba) * proto.PART_SECTOR_SIZE,
+      end: (groupEnd - lba) * proto.PART_SECTOR_SIZE,
+    };
   }
 
   async writeBootPartition(hwpart: 1 | 2, data: BinarySource): Promise<void> {
@@ -640,7 +656,7 @@ export class Superbird {
     totalBytes: number,
     makeCommand: (byteOffset: number, byteLength: number) => string,
     options: WriteOptions,
-    flags: { expectTimeout?: boolean; sparse?: boolean } = {},
+    flags: { expectTimeout?: boolean; skippable?: ByteSegment | null } = {},
   ): Promise<void> {
     const tracker = new ProgressTracker(totalBytes);
     const blockLength = options.blockLength ?? this.config.transferBlockSize;
@@ -653,9 +669,13 @@ export class Superbird {
 
         const length = Math.min(totalBytes - offset, this.config.stageChunkSize);
         const chunk = await reader.readExact(length);
-        const segments = flags.sparse
-          ? nonZeroSegments(chunk, blockLength, this.config.sparseSkipThreshold)
-          : [{ start: 0, end: length }];
+        const segments = writableSegments(
+          chunk,
+          offset,
+          blockLength,
+          this.config.sparseSkipThreshold,
+          flags.skippable ?? null,
+        );
 
         let written = 0;
         for (const segment of segments) {
