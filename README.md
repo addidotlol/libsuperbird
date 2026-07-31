@@ -29,7 +29,7 @@ await thing.restorePartition('boot_a', bootImageBlob, {
 
 ## Sparse flashing
 
-Filesystem images are mostly zeros, and normally every zero byte crosses USB and gets written. Passing `sparse: true` to `writeUserArea` erases the complete 4 MiB eMMC erase groups covered by the image and skips 8 MiB staging chunks that contain only zeros and lie entirely inside that erased range. Unaligned edges and nonzero chunks are written in full.
+Filesystem images are mostly zeros, and normally every zero byte crosses USB and gets written. Passing `sparse: true` to `writeUserArea` erases the complete 4 MiB eMMC erase groups covered by the image and skips 8 MiB staging chunks that contain only zeros and lie entirely inside a successfully erased range. If U-Boot refuses to erase part of the range (for example because it overlaps the protected key area), the erase is split around the rejected erase groups; chunks over unerased groups are always written in full, as are unaligned edges and nonzero chunks.
 
 ```ts
 await thing.writeUserArea(0, image, { sparse: true });

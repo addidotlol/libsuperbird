@@ -79,6 +79,21 @@ const USB_FILTERS: USBDeviceFilter[] = [
 
 const INTERFACE_NUMBER = 0;
 
+interface SectorRange {
+  start: number;
+  end: number;
+}
+
+function mergeAdjacentRanges(ranges: SectorRange[]): SectorRange[] {
+  const merged: SectorRange[] = [];
+  for (const range of ranges) {
+    const last = merged[merged.length - 1];
+    if (last && last.end === range.start) last.end = range.end;
+    else merged.push({ ...range });
+  }
+  return merged;
+}
+
 class ProgressTracker {
   private start = performance.now();
   private processed = 0;
@@ -569,7 +584,7 @@ export class Superbird {
     await this.bulkcmd('mmc dev 1 0');
     await this.bulkcmd('amlmmc key');
 
-    const erasedRange = options.sparse ? await this.eraseWholeGroupsIn(lba, size) : null;
+    const erasedRanges = options.sparse ? await this.eraseWholeGroupsIn(lba, size) : [];
 
     await this.stagedWrite(
       reader,
@@ -580,26 +595,38 @@ export class Superbird {
         return `mmc write ${hex(proto.ADDR_TMP)} ${hex(chunkLba)} ${hex(sectors)}`;
       },
       options,
-      { sparse: options.sparse, erasedRange },
+      { sparse: options.sparse, erasedRanges },
     );
   }
 
-  private async eraseWholeGroupsIn(
-    lba: number,
-    byteLength: number,
-  ): Promise<{ start: number; end: number } | null> {
+  private async eraseWholeGroupsIn(lba: number, byteLength: number): Promise<SectorRange[]> {
     const spanSectors = Math.ceil(byteLength / proto.PART_SECTOR_SIZE);
     const groupStart = Math.ceil(lba / proto.ERASE_GROUP_SECTORS) * proto.ERASE_GROUP_SECTORS;
     const groupEnd =
       Math.floor((lba + spanSectors) / proto.ERASE_GROUP_SECTORS) * proto.ERASE_GROUP_SECTORS;
-    if (groupEnd <= groupStart) return null;
+    if (groupEnd <= groupStart) return [];
 
-    await this.bulkcmd(`mmc erase ${hex(groupStart)} ${hex(groupEnd - groupStart)}`);
+    const erased = await this.eraseAroundProtectedGroups(groupStart, groupEnd);
+    return mergeAdjacentRanges(erased).map(range => ({
+      start: (range.start - lba) * proto.PART_SECTOR_SIZE,
+      end: (range.end - lba) * proto.PART_SECTOR_SIZE,
+    }));
+  }
 
-    return {
-      start: (groupStart - lba) * proto.PART_SECTOR_SIZE,
-      end: (groupEnd - lba) * proto.PART_SECTOR_SIZE,
-    };
+  private async eraseAroundProtectedGroups(startSector: number, endSector: number): Promise<SectorRange[]> {
+    try {
+      await this.bulkcmd(`mmc erase ${hex(startSector)} ${hex(endSector - startSector)}`);
+      return [{ start: startSector, end: endSector }];
+    } catch (error) {
+      if (!(error instanceof SuperbirdError) || error.code !== 'bulkcmd-failed') throw error;
+      const groups = (endSector - startSector) / proto.ERASE_GROUP_SECTORS;
+      if (groups <= 1) return [];
+      const midSector = startSector + Math.floor(groups / 2) * proto.ERASE_GROUP_SECTORS;
+      return [
+        ...(await this.eraseAroundProtectedGroups(startSector, midSector)),
+        ...(await this.eraseAroundProtectedGroups(midSector, endSector)),
+      ];
+    }
   }
 
   async writeBootPartition(hwpart: 1 | 2, data: BinarySource): Promise<void> {
@@ -637,7 +664,7 @@ export class Superbird {
     flags: {
       expectTimeout?: boolean;
       sparse?: boolean;
-      erasedRange?: { start: number; end: number } | null;
+      erasedRanges?: SectorRange[];
     } = {},
   ): Promise<void> {
     const tracker = new ProgressTracker(totalBytes);
@@ -652,10 +679,7 @@ export class Superbird {
         const length = Math.min(totalBytes - offset, this.config.stageChunkSize);
         const chunk = await reader.readExact(length);
         const erased =
-          flags.erasedRange !== null &&
-          flags.erasedRange !== undefined &&
-          offset >= flags.erasedRange.start &&
-          offset + length <= flags.erasedRange.end;
+          flags.erasedRanges?.some(range => offset >= range.start && offset + length <= range.end) ?? false;
         const skipped = flags.sparse === true && erased && chunk.every(byte => byte === 0);
 
         if (!skipped) {
