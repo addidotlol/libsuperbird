@@ -5,7 +5,6 @@ import { SUPERBIRD_PARTITIONS, type PartitionName } from './partitions.js';
 import * as proto from './protocol.js';
 import {
   type BinarySource,
-  type ByteSegment,
   type StreamSource,
   ByteReader,
   hex,
@@ -15,7 +14,6 @@ import {
   sleep,
   toBytes,
   withTimeout,
-  writableSegments,
 } from './util.js';
 
 export type SuperbirdMode = 'usb' | 'usb-burn' | 'normal';
@@ -44,7 +42,6 @@ export interface SuperbirdConfig {
   slowCommandMs: number;
   resetDelayMs: number;
   reconnectTimeoutMs: number;
-  sparseSkipThreshold: number;
 }
 
 export const DEFAULT_CONFIG: SuperbirdConfig = {
@@ -58,7 +55,6 @@ export const DEFAULT_CONFIG: SuperbirdConfig = {
   slowCommandMs: 3000,
   resetDelayMs: 5000,
   reconnectTimeoutMs: 30_000,
-  sparseSkipThreshold: 1024 * 1024,
 };
 
 export interface ConnectOptions {
@@ -547,16 +543,6 @@ export class Superbird {
     await this.bulkcmd(`amlmmc erase ${name}`);
   }
 
-  private async readsBackZero(readCommand: string): Promise<boolean> {
-    try {
-      await this.bulkcmd(readCommand);
-      const sector = await this.readMemory(proto.ADDR_TMP, proto.PART_SECTOR_SIZE);
-      return sector.every(byte => byte === 0);
-    } catch {
-      return false;
-    }
-  }
-
   async restorePartition(name: PartitionName, data: StreamSource, options: WriteOptions = {}): Promise<void> {
     const partSize = await this.validatePartitionSize(name);
     const { reader, size } = await resolveStream(data);
@@ -567,22 +553,13 @@ export class Superbird {
       throw invalidOperation(`file is larger than target partition: ${size} bytes vs ${effectivePartSize} bytes`);
     }
 
-    let skippable: ByteSegment | null = null;
-    if (options.sparse && name !== 'bootloader') {
-      await this.erasePartition(name);
-      const erasedToZero = await this.readsBackZero(
-        `amlmmc read ${name} ${hex(proto.ADDR_TMP)} 0 ${hex(proto.PART_SECTOR_SIZE)}`,
-      );
-      if (erasedToZero) skippable = { start: 0, end: size };
-    }
-
     await this.bulkcmd('amlmmc key');
     await this.stagedWrite(
       reader,
       size,
       (offset, length) => `amlmmc write ${name} ${hex(proto.ADDR_TMP)} ${hex(offset)} ${hex(length)}`,
       options,
-      { expectTimeout: name === 'bootloader', skippable },
+      { expectTimeout: name === 'bootloader' },
     );
   }
 
@@ -590,10 +567,10 @@ export class Superbird {
     const { reader, size } = await resolveStream(data);
 
     await this.bulkcmd('mmc dev 1 0');
-
-    const skippable = options.sparse ? await this.eraseWholeGroupsIn(lba, size) : null;
-
     await this.bulkcmd('amlmmc key');
+
+    const erasedRange = options.sparse ? await this.eraseWholeGroupsIn(lba, size) : null;
+
     await this.stagedWrite(
       reader,
       size,
@@ -603,11 +580,14 @@ export class Superbird {
         return `mmc write ${hex(proto.ADDR_TMP)} ${hex(chunkLba)} ${hex(sectors)}`;
       },
       options,
-      { skippable },
+      { sparse: options.sparse, erasedRange },
     );
   }
 
-  private async eraseWholeGroupsIn(lba: number, byteLength: number): Promise<ByteSegment | null> {
+  private async eraseWholeGroupsIn(
+    lba: number,
+    byteLength: number,
+  ): Promise<{ start: number; end: number } | null> {
     const spanSectors = Math.ceil(byteLength / proto.PART_SECTOR_SIZE);
     const groupStart = Math.ceil(lba / proto.ERASE_GROUP_SECTORS) * proto.ERASE_GROUP_SECTORS;
     const groupEnd =
@@ -615,8 +595,6 @@ export class Superbird {
     if (groupEnd <= groupStart) return null;
 
     await this.bulkcmd(`mmc erase ${hex(groupStart)} ${hex(groupEnd - groupStart)}`);
-    const erasedToZero = await this.readsBackZero(`mmc read ${hex(proto.ADDR_TMP)} ${hex(groupStart)} 1`);
-    if (!erasedToZero) return null;
 
     return {
       start: (groupStart - lba) * proto.PART_SECTOR_SIZE,
@@ -656,7 +634,11 @@ export class Superbird {
     totalBytes: number,
     makeCommand: (byteOffset: number, byteLength: number) => string,
     options: WriteOptions,
-    flags: { expectTimeout?: boolean; skippable?: ByteSegment | null } = {},
+    flags: {
+      expectTimeout?: boolean;
+      sparse?: boolean;
+      erasedRange?: { start: number; end: number } | null;
+    } = {},
   ): Promise<void> {
     const tracker = new ProgressTracker(totalBytes);
     const blockLength = options.blockLength ?? this.config.transferBlockSize;
@@ -669,19 +651,16 @@ export class Superbird {
 
         const length = Math.min(totalBytes - offset, this.config.stageChunkSize);
         const chunk = await reader.readExact(length);
-        const segments = writableSegments(
-          chunk,
-          offset,
-          blockLength,
-          this.config.sparseSkipThreshold,
-          flags.skippable ?? null,
-        );
+        const erased =
+          flags.erasedRange !== null &&
+          flags.erasedRange !== undefined &&
+          offset >= flags.erasedRange.start &&
+          offset + length <= flags.erasedRange.end;
+        const skipped = flags.sparse === true && erased && chunk.every(byte => byte === 0);
 
-        let written = 0;
-        for (const segment of segments) {
-          options.signal?.throwIfAborted();
-          await this.writeLargeMemory(proto.ADDR_TMP, chunk.subarray(segment.start, segment.end), blockLength);
-          const command = makeCommand(offset + segment.start, segment.end - segment.start);
+        if (!skipped) {
+          await this.writeLargeMemory(proto.ADDR_TMP, chunk, blockLength);
+          const command = makeCommand(offset, length);
 
           if (flags.expectTimeout) {
             await this.bulkcmd(command).catch(() => {});
@@ -691,11 +670,10 @@ export class Superbird {
             await retry(this.config.writeRetries, this.config.cooldownMs, () => this.bulkcmd(command));
             if (performance.now() - commandStart > this.config.slowCommandMs) await sleep(this.config.cooldownMs);
           }
-          written += segment.end - segment.start;
         }
 
         offset += length;
-        options.onProgress?.(tracker.advance(length, performance.now() - chunkStart, length - written));
+        options.onProgress?.(tracker.advance(length, performance.now() - chunkStart, skipped ? length : 0));
       }
     } finally {
       await reader.cancel();

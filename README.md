@@ -29,16 +29,13 @@ await thing.restorePartition('boot_a', bootImageBlob, {
 
 ## Sparse flashing
 
-Filesystem images are mostly zeros, and normally every zero byte crosses USB and gets written. Passing `sparse: true` skips zero regions instead, which can roughly halve flash times. The target has to be erased first so skipped regions actually read as zeros. Calling `restorePartition` will do this for you. If you use `writeUserArea` call `erase()` yourself:
+Filesystem images are mostly zeros, and normally every zero byte crosses USB and gets written. Passing `sparse: true` to `writeUserArea` erases the complete 4 MiB eMMC erase groups covered by the image and skips 8 MiB staging chunks that contain only zeros and lie entirely inside that erased range. Unaligned edges and nonzero chunks are written in full.
 
 ```ts
-await thing.restorePartition('system_a', image, { sparse: true });
-
-await thing.erase(0, Math.ceil(image.size / 512));
 await thing.writeUserArea(0, image, { sparse: true });
 ```
 
-`libsuperbird` will verify the sector is erased before Sparse flashing. If not erased, it will fall back to a full write. 
+`restorePartition` always writes the complete image.
 
 ## Browser support
 
